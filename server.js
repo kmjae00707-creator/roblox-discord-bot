@@ -43,6 +43,7 @@ client.on('interactionCreate', async interaction => {
     if (!interaction.isButton()) return;
 
     try {
+        // 🔴 이 모델 알림 끄기 — mute, update the original message
         if (interaction.customId.startsWith('mute_')) {
             const modelName = decodeURIComponent(interaction.customId.slice(5));
             mutedList.add(modelName);
@@ -52,6 +53,32 @@ client.on('interactionCreate', async interaction => {
                 components: [],
             });
             console.log(`[MUTE] ${modelName}`);
+            return;
+        }
+
+        // 🟢 알람 켜기 — unmute, ephemeral reply so chat stays clean
+        if (interaction.customId.startsWith('unmute_')) {
+            const modelName = decodeURIComponent(interaction.customId.slice(7));
+            mutedList.delete(modelName);
+            await interaction.reply({
+                content:   `🔔 **\`${modelName}\`** 알림이 다시 켜졌습니다.`,
+                ephemeral: true,
+            });
+            console.log(`[UNMUTE] ${modelName}`);
+            return;
+        }
+
+        // 🔘 끈 알람 목록 — show muted list as ephemeral reply
+        if (interaction.customId === 'showmuted') {
+            const list = [...mutedList];
+            const body  = list.length
+                ? list.map((n, i) => `${i + 1}. \`${n}\``).join('\n')
+                : '뮤트된 모델이 없습니다.';
+            await interaction.reply({
+                content:   `**🔇 뮤트된 모델 목록 (${list.length}개):**\n${body}`,
+                ephemeral: true,
+            });
+            return;
         }
     } catch (e) {
         console.error('Interaction error:', e.message);
@@ -140,13 +167,21 @@ app.post('/notify', async (req, res) => {
         const channel = await client.channels.fetch(CHANNEL_ID);
         if (!channel) throw new Error('Channel not found');
 
-        // Discord customId has a 100-char limit
+        // Discord customId has a 100-char limit; prefix is 7 chars ("unmute_")
         const safeId  = encodeURIComponent(modelName).slice(0, 85);
         const muteRow = new ActionRowBuilder().addComponents(
             new ButtonBuilder()
                 .setCustomId(`mute_${safeId}`)
                 .setLabel('이 모델 알림 끄기')
-                .setStyle(ButtonStyle.Danger)
+                .setStyle(ButtonStyle.Danger),
+            new ButtonBuilder()
+                .setCustomId(`unmute_${safeId}`)
+                .setLabel('알람 켜기')
+                .setStyle(ButtonStyle.Success),
+            new ButtonBuilder()
+                .setCustomId('showmuted')
+                .setLabel('끈 알람 목록')
+                .setStyle(ButtonStyle.Secondary)
         );
 
         await channel.send({
