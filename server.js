@@ -7,7 +7,6 @@ const {
     ActionRowBuilder,
     ButtonBuilder,
     ButtonStyle,
-    MessageFlags,
 } = require('discord.js');
 
 const app = express();
@@ -23,88 +22,6 @@ if (!BOT_TOKEN || !CHANNEL_ID) {
 
 // In-memory muted list (persists while server is running)
 let mutedList = new Set();
-
-function safeEncodeModelId(modelName) {
-    return encodeURIComponent(modelName).slice(0, 85);
-}
-
-function safeDecodeModelId(encoded) {
-    try {
-        return decodeURIComponent(encoded);
-    } catch {
-        return encoded;
-    }
-}
-
-function buildNotifyButtons(modelName) {
-    const safeId = safeEncodeModelId(modelName);
-    return new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-            .setCustomId(`mute_${safeId}`)
-            .setLabel('이 모델 알림 끄기')
-            .setStyle(ButtonStyle.Danger),
-        new ButtonBuilder()
-            .setCustomId(`unmute_${safeId}`)
-            .setLabel('알람 켜기')
-            .setStyle(ButtonStyle.Success),
-        new ButtonBuilder()
-            .setCustomId('showmuted')
-            .setLabel('끈 알람 목록')
-            .setStyle(ButtonStyle.Secondary)
-    );
-}
-
-function buildMutedActionRow(modelName) {
-    const safeId = safeEncodeModelId(modelName);
-    return new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-            .setCustomId(`unmute_${safeId}`)
-            .setLabel('알람 켜기')
-            .setStyle(ButtonStyle.Success),
-        new ButtonBuilder()
-            .setCustomId('showmuted')
-            .setLabel('끈 알람 목록')
-            .setStyle(ButtonStyle.Secondary)
-    );
-}
-
-function buildMutedListRows() {
-    const rows = [];
-    let current = [];
-
-    for (const name of mutedList) {
-        if (current.length >= 5) {
-            rows.push(new ActionRowBuilder().addComponents(...current));
-            current = [];
-            if (rows.length >= 4) break;
-        }
-        const label = name.length > 80 ? name.slice(0, 77) + '...' : name;
-        current.push(
-            new ButtonBuilder()
-                .setCustomId(`unmute_${safeEncodeModelId(name)}`)
-                .setLabel(label)
-                .setStyle(ButtonStyle.Success)
-        );
-    }
-
-    if (current.length > 0 && rows.length < 5) {
-        rows.push(new ActionRowBuilder().addComponents(...current));
-    }
-
-    return rows;
-}
-
-async function replyError(interaction, message) {
-    const payload = {
-        content: message,
-        flags: MessageFlags.Ephemeral,
-    };
-    if (interaction.replied || interaction.deferred) {
-        await interaction.followUp(payload);
-    } else {
-        await interaction.reply(payload);
-    }
-}
 
 // ==========================================
 // Discord Client
@@ -125,62 +42,46 @@ client.once('ready', () => {
 client.on('interactionCreate', async interaction => {
     if (!interaction.isButton()) return;
 
-    const id = interaction.customId;
-
     try {
-        // 🟢 알람 켜기 — check BEFORE mute_ (safe order)
-        if (id.startsWith('unmute_')) {
-            const modelName = safeDecodeModelId(id.slice(7));
-            mutedList.delete(modelName);
-            await interaction.update({
-                content: '@everyone',
-                embeds: [{
-                    title: '🔔 알림이 다시 켜졌습니다!',
-                    description: `**\`${modelName}\`** 모델 알림이 활성화되었습니다.`,
-                    color: 0x44AA44,
-                }],
-                components: [buildNotifyButtons(modelName)],
-            });
-            console.log(`[UNMUTE] ${modelName}`);
-            return;
-        }
-
-        // 🔴 이 모델 알림 끄기 — keep unmute button on message
-        if (id.startsWith('mute_')) {
-            const modelName = safeDecodeModelId(id.slice(5));
+        // 🔴 이 모델 알림 끄기 — mute, update the original message
+        if (interaction.customId.startsWith('mute_')) {
+            const modelName = decodeURIComponent(interaction.customId.slice(5));
             mutedList.add(modelName);
             await interaction.update({
-                content: '@everyone',
-                embeds: [{
-                    title: '🔇 알림이 꺼졌습니다',
-                    description: `**\`${modelName}\`** 모델 알림이 꺼졌습니다.\n아래 **알람 켜기** 버튼으로 다시 켤 수 있습니다.`,
-                    color: 0x888888,
-                }],
-                components: [buildMutedActionRow(modelName)],
+                content:    `🔇 **\`${modelName}\`** 알림이 꺼졌습니다.`,
+                embeds:     [],
+                components: [],
             });
             console.log(`[MUTE] ${modelName}`);
             return;
         }
 
-        // 🔘 끈 알람 목록 — list + per-model unmute buttons
-        if (id === 'showmuted') {
+        // 🟢 알람 켜기 — unmute, ephemeral reply so chat stays clean
+        if (interaction.customId.startsWith('unmute_')) {
+            const modelName = decodeURIComponent(interaction.customId.slice(7));
+            mutedList.delete(modelName);
+            await interaction.reply({
+                content:   `🔔 **\`${modelName}\`** 알림이 다시 켜졌습니다.`,
+                ephemeral: true,
+            });
+            console.log(`[UNMUTE] ${modelName}`);
+            return;
+        }
+
+        // 🔘 끈 알람 목록 — show muted list as ephemeral reply
+        if (interaction.customId === 'showmuted') {
             const list = [...mutedList];
-            const body = list.length
+            const body  = list.length
                 ? list.map((n, i) => `${i + 1}. \`${n}\``).join('\n')
                 : '뮤트된 모델이 없습니다.';
-            const rows = buildMutedListRows();
             await interaction.reply({
                 content:   `**🔇 뮤트된 모델 목록 (${list.length}개):**\n${body}`,
-                components: rows,
-                flags: MessageFlags.Ephemeral,
+                ephemeral: true,
             });
             return;
         }
     } catch (e) {
-        console.error('Interaction error:', e);
-        try {
-            await replyError(interaction, '❌ 처리 중 오류가 발생했습니다. 다시 시도해주세요.');
-        } catch (_) {}
+        console.error('Interaction error:', e.message);
     }
 });
 
@@ -266,7 +167,22 @@ app.post('/notify', async (req, res) => {
         const channel = await client.channels.fetch(CHANNEL_ID);
         if (!channel) throw new Error('Channel not found');
 
-        const muteRow = buildNotifyButtons(modelName);
+        // Discord customId has a 100-char limit; prefix is 7 chars ("unmute_")
+        const safeId  = encodeURIComponent(modelName).slice(0, 85);
+        const muteRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId(`mute_${safeId}`)
+                .setLabel('이 모델 알림 끄기')
+                .setStyle(ButtonStyle.Danger),
+            new ButtonBuilder()
+                .setCustomId(`unmute_${safeId}`)
+                .setLabel('알람 켜기')
+                .setStyle(ButtonStyle.Success),
+            new ButtonBuilder()
+                .setCustomId('showmuted')
+                .setLabel('끈 알람 목록')
+                .setStyle(ButtonStyle.Secondary)
+        );
 
         await channel.send({
             content: '@everyone',
