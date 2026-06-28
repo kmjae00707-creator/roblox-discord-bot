@@ -1,0 +1,1946 @@
+-- crazymobile.lua — crazy.lua 모바일 버전 (터치 UI + 공유 config)
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local Workspace        = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
+local HttpService      = game:GetService("HttpService")
+local PhysicsService   = game:GetService("PhysicsService")
+local VIM              = game:GetService("VirtualInputManager")
+
+local localPlayer = Players.LocalPlayer
+local camera      = Workspace.CurrentCamera
+local accountKey  = localPlayer.Name
+
+-- ==========================================
+-- [ SERVER CONFIG ]
+-- ==========================================
+-- Set this to your Render deployment URL (e.g. "https://crazy-entity.onrender.com")
+local SERVER_URL = "https://roblox-discord-bot-2-5dy4.onrender.com"
+
+-- ==========================================
+-- [ AIMBOT SETTINGS ]
+-- ==========================================
+local projectileSpeed  = 350
+local chargingDelay    = 0.5
+local isSystemOn       = true
+local mouseSensitivity = 0.3
+local leadMultiplier   = 1.4
+local extraFrontOffset = 0.7
+local myVelocityWeight = 0
+
+local APPROACH_DIST = 80
+local STOP_DIST     = 50
+local isApproaching = false
+
+local isAutoTargetOn        = false
+local isAutoMoveOn          = false
+local isCharging            = false
+local lastShotTime          = 0
+local selectedModelInstance = nil
+local isEquipping           = false
+local lastMoveChange        = 0
+local moveChangeInterval    = 1
+local currentMoveDir        = Vector3.new(0, 0, 0)
+
+local isAutoItemOn   = false
+local isAutoTwoOn    = false
+local isSkillCasting = false
+local isWindowFocused = true
+local IS_TOUCH        = UserInputService.TouchEnabled
+local aimScreenX, aimScreenY = nil, nil
+local isTouchBlockOn = false
+local setrairtyValue = nil
+local serverLinkValue = ""
+
+-- ==========================================
+-- [ NOTIFY STATE ]
+-- ==========================================
+local isWatchOn    = false
+local watchConn    = nil
+local seenModels   = {}   -- ordered unique name list (persistent)
+local blockedNames = {}   -- set: true = muted
+
+-- ==========================================
+-- [ CONFIG — 계정별 workspace 저장/자동 로드 ]
+-- crazy/config.json 예시:
+-- {
+--   "The_vantiy": { "aimbot": {...}, "toggles": {...}, ... },
+--   "broski":     { "aimbot": {...}, "toggles": {...}, ... }
+-- }
+-- ==========================================
+local CONFIG_PATH         = "crazy/config.json" -- PC와 계정별 설정 공유
+local CONFIG_VERSION      = 1
+local pendingGui          = { x = 10, y = 10, tab = "main" }
+local pendingSelectedName = nil
+local scheduleSaveConfig  = function() end
+
+local function canUseConfigIO()
+    return type(writefile) == "function"
+        and type(readfile) == "function"
+        and type(isfile) == "function"
+        and type(isfolder) == "function"
+        and type(makefolder) == "function"
+end
+
+local function ensureConfigDir()
+    if not canUseConfigIO() then return false end
+    local dir = CONFIG_PATH:match("(.+)/[^/]+$")
+    if dir and not isfolder(dir) then
+        pcall(makefolder, dir)
+    end
+    return true
+end
+
+local function isLegacySingleConfig(data)
+    return type(data) == "table" and type(data.aimbot) == "table"
+end
+
+local function readConfigStore()
+    if not canUseConfigIO() or not isfile(CONFIG_PATH) then
+        return {}
+    end
+    local ok, raw = pcall(readfile, CONFIG_PATH)
+    if not ok or type(raw) ~= "string" or raw == "" then
+        return {}
+    end
+    local decodeOk, data = pcall(function()
+        return HttpService:JSONDecode(raw)
+    end)
+    if not decodeOk or type(data) ~= "table" then
+        return {}
+    end
+    -- 예전 단일 config → 현재 계정 키로 자동 변환
+    if isLegacySingleConfig(data) then
+        local store = { [accountKey] = data }
+        pcall(function()
+            ensureConfigDir()
+            writefile(CONFIG_PATH, HttpService:JSONEncode(store))
+        end)
+        return store
+    end
+    return data
+end
+
+local function writeConfigStore(store)
+    if not canUseConfigIO() then return end
+    if not ensureConfigDir() then return end
+    local ok, json = pcall(function()
+        return HttpService:JSONEncode(store)
+    end)
+    if ok and json then
+        pcall(writefile, CONFIG_PATH, json)
+    end
+end
+
+local function copyStringList(src)
+    local out = {}
+    if type(src) == "table" then
+        for i, v in ipairs(src) do
+            if type(v) == "string" then out[i] = v end
+        end
+    end
+    return out
+end
+
+local function getDefaultConfig()
+    return {
+        version = CONFIG_VERSION,
+        aimbot = {
+            isSystemOn       = true,
+            projectileSpeed  = 350,
+            chargingDelay    = 0.5,
+            mouseSensitivity = 0.3,
+            leadMultiplier   = 1.4,
+            extraFrontOffset = 0.7,
+            myVelocityWeight = 0,
+        },
+        toggles = {
+            isAutoTargetOn = false,
+            isAutoMoveOn   = false,
+            isAutoItemOn   = false,
+            isAutoTwoOn    = false,
+            isTouchBlockOn = false,
+            isWatchOn      = false,
+        },
+        selectedTargetName = nil,
+        blockedNames       = {},
+        seenModels         = {},
+        Setrairty          = nil,
+        serverLink         = "",
+        gui = { x = 10, y = 10, tab = "main" },
+    }
+end
+
+local function applyLoadedConfig(cfg)
+    if type(cfg) ~= "table" then return end
+
+    local aim = cfg.aimbot
+    if type(aim) == "table" then
+        if type(aim.isSystemOn) == "boolean"       then isSystemOn       = aim.isSystemOn end
+        if type(aim.projectileSpeed) == "number"    then projectileSpeed  = aim.projectileSpeed end
+        if type(aim.chargingDelay) == "number"       then chargingDelay    = aim.chargingDelay end
+        if type(aim.mouseSensitivity) == "number"    then mouseSensitivity = aim.mouseSensitivity end
+        if type(aim.leadMultiplier) == "number"      then leadMultiplier   = aim.leadMultiplier end
+        if type(aim.extraFrontOffset) == "number"    then extraFrontOffset = aim.extraFrontOffset end
+        if type(aim.myVelocityWeight) == "number"    then myVelocityWeight = aim.myVelocityWeight end
+    end
+
+    local toggles = cfg.toggles
+    if type(toggles) == "table" then
+        if type(toggles.isAutoTargetOn) == "boolean" then isAutoTargetOn = toggles.isAutoTargetOn end
+        if type(toggles.isAutoMoveOn) == "boolean"   then isAutoMoveOn   = toggles.isAutoMoveOn end
+        if type(toggles.isAutoItemOn) == "boolean"   then isAutoItemOn   = toggles.isAutoItemOn end
+        if type(toggles.isAutoTwoOn) == "boolean"    then isAutoTwoOn    = toggles.isAutoTwoOn end
+        if type(toggles.isTouchBlockOn) == "boolean" then isTouchBlockOn = toggles.isTouchBlockOn end
+        if type(toggles.isWatchOn) == "boolean"      then isWatchOn      = toggles.isWatchOn end
+    end
+
+    if cfg.blockedNames ~= nil then
+        for k in pairs(blockedNames) do blockedNames[k] = nil end
+        for _, name in ipairs(copyStringList(cfg.blockedNames)) do
+            blockedNames[name] = true
+        end
+    end
+
+    if cfg.seenModels ~= nil then
+        seenModels = copyStringList(cfg.seenModels)
+    end
+
+    if type(cfg.selectedTargetName) == "string" and cfg.selectedTargetName ~= "" then
+        pendingSelectedName = cfg.selectedTargetName
+    end
+
+    if cfg.Setrairty ~= nil then
+        local n = tonumber(cfg.Setrairty)
+        if n then setrairtyValue = n end
+    end
+
+    if type(cfg.serverLink) == "string" then
+        serverLinkValue = cfg.serverLink
+    end
+
+    local gui = cfg.gui
+    if type(gui) == "table" then
+        if type(gui.x) == "number" then pendingGui.x = gui.x end
+        if type(gui.y) == "number" then pendingGui.y = gui.y end
+        if gui.tab == "main" or gui.tab == "misc" then pendingGui.tab = gui.tab end
+    end
+end
+
+local function loadConfigFromFile()
+    local defaults = getDefaultConfig()
+    local store      = readConfigStore()
+    local accountCfg = store[accountKey]
+
+    applyLoadedConfig(defaults)
+    if type(accountCfg) == "table" then
+        applyLoadedConfig(accountCfg)
+    end
+    return accountCfg or defaults
+end
+
+loadConfigFromFile()
+
+-- ==========================================
+-- [ PREDICTION INDICATOR ]
+-- ==========================================
+local indicator = Instance.new("Part")
+indicator.Size        = Vector3.new(1.2, 1.2, 1.2)
+indicator.Shape       = Enum.PartType.Ball
+indicator.Color       = Color3.fromRGB(255, 60, 60)
+indicator.Material    = Enum.Material.Neon
+indicator.Anchored    = true
+indicator.CanCollide  = false
+indicator.Parent      = Workspace
+
+-- ==========================================
+-- [ MOUSE HELPERS ]
+-- ==========================================
+local function worldToScreen(worldPos)
+    local vp, visible = camera:WorldToViewportPoint(worldPos)
+    if visible and vp.Z > 0 then
+        return vp.X, vp.Y, true
+    end
+    return nil, nil, false
+end
+
+local function syncMouseToAim()
+    if not aimScreenX or not aimScreenY then return end
+    pcall(function()
+        VIM:SendMouseMoveEvent(aimScreenX, aimScreenY, game)
+    end)
+end
+
+local function safeMousePress()
+    if not isCharging then
+        isCharging   = true
+        lastShotTime = tick()
+        syncMouseToAim()
+        local x = aimScreenX or 0
+        local y = aimScreenY or 0
+        VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
+    end
+end
+
+local function safeMouseRelease()
+    if isCharging then
+        isCharging = false
+        syncMouseToAim()
+        local x = aimScreenX or 0
+        local y = aimScreenY or 0
+        VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
+    end
+end
+
+local function calculateRelativeLeadPosition(targetPos, targetVelocity, myPos, myVelocity, bulletSpeed)
+    local distance        = (targetPos - myPos).Magnitude
+    local totalTime       = (distance / bulletSpeed) + chargingDelay
+    local blendedVelocity = targetVelocity - (myVelocity * myVelocityWeight)
+    local moveDirection   = blendedVelocity.Magnitude > 0.1
+        and blendedVelocity.Unit or Vector3.new(0, 0, 0)
+    local leadVector      = (blendedVelocity * totalTime * leadMultiplier)
+        + (moveDirection * extraFrontOffset)
+    return targetPos + leadVector
+end
+
+-- ==========================================
+-- [ TOUCH BLOCK MAX ]
+-- ==========================================
+local TOUCH_COLLISION_GROUP = "Crazy22Ghost"
+pcall(function()
+    PhysicsService:RegisterCollisionGroup(TOUCH_COLLISION_GROUP)
+end)
+
+local touchCharConns      = {}
+local touchPartConns      = {}
+local touchDisabledConns  = {}
+local touchDisabledSet    = {}
+local touchSavedProps     = {}
+local touchLoopConns      = {}
+local touchFireHooked     = false
+local touchOrigFireTouch  = nil
+local touchNamecallHooked = false
+local touchOrigNamecall   = nil
+
+local TOUCH_ROOT_PARTS = {
+    HumanoidRootPart = true,
+    LowerTorso       = true,
+}
+
+local function wipeTable(t)
+    for k in pairs(t) do t[k] = nil end
+end
+
+local function deferFn(fn)
+    if task and task.defer then task.defer(fn) else spawn(fn) end
+end
+
+local function isTouchMyPart(part)
+    if not part or not localPlayer.Character then return false end
+    return part:IsDescendantOf(localPlayer.Character)
+end
+
+local function isTouchRootPart(part)
+    return TOUCH_ROOT_PARTS[part.Name] == true
+end
+
+local function clearTouchList(conns)
+    for _, conn in ipairs(conns) do
+        pcall(function() conn:Disconnect() end)
+    end
+    wipeTable(conns)
+end
+
+local function rememberTouchPart(part)
+    if not touchSavedProps[part] then
+        touchSavedProps[part] = {
+            CanTouch       = part.CanTouch,
+            CanCollide     = part.CanCollide,
+            CanQuery       = part.CanQuery,
+            CollisionGroup = part.CollisionGroup,
+        }
+    end
+end
+
+local function muteTouchConn(conn)
+    if touchDisabledSet[conn] then return end
+    touchDisabledSet[conn] = true
+    pcall(function() conn:Disable() end)
+    table.insert(touchDisabledConns, conn)
+end
+
+local function restoreTouchSignals()
+    for _, conn in ipairs(touchDisabledConns) do
+        pcall(function() conn:Enable() end)
+    end
+    wipeTable(touchDisabledConns)
+    wipeTable(touchDisabledSet)
+end
+
+local function installTouchFireHook()
+    if touchFireHooked or not firetouchinterest or not hookfunction then return end
+    local ok = pcall(function()
+        touchOrigFireTouch = hookfunction(firetouchinterest, function(part0, part1, toggle)
+            if isTouchBlockOn and (isTouchMyPart(part0) or isTouchMyPart(part1)) then return end
+            return touchOrigFireTouch(part0, part1, toggle)
+        end)
+    end)
+    if ok then touchFireHooked = true end
+end
+
+local function installTouchNamecallHook()
+    if touchNamecallHooked or not hookmetamethod or not getnamecallmethod then return end
+    local ok = pcall(function()
+        touchOrigNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+            local method = getnamecallmethod()
+            if isTouchBlockOn and method == "FireTouchInterest" then
+                local args = { ... }
+                if isTouchMyPart(args[1]) or isTouchMyPart(args[2]) then return end
+            end
+            return touchOrigNamecall(self, ...)
+        end)
+    end)
+    if ok then touchNamecallHooked = true end
+end
+
+local TOUCH_CHILD_CLASSES = { TouchInterest = true, TouchTransmitter = true }
+
+local function removeTouchInternals(part)
+    for _, child in ipairs(part:GetChildren()) do
+        if TOUCH_CHILD_CLASSES[child.ClassName] then
+            pcall(function() child:Destroy() end)
+        end
+    end
+end
+
+local function mutePartTouchSignals(part)
+    if not getconnections then return end
+    pcall(function()
+        for _, conn in ipairs(getconnections(part.Touched)) do muteTouchConn(conn) end
+    end)
+    pcall(function()
+        for _, conn in ipairs(getconnections(part.TouchEnded)) do muteTouchConn(conn) end
+    end)
+end
+
+local function silenceExternalTouching(char)
+    if not getconnections then return end
+    local checked = {}
+    for _, obj in ipairs(char:GetDescendants()) do
+        if obj:IsA("BasePart") then
+            local touching = {}
+            pcall(function() touching = obj:GetTouchingParts() end)
+            for _, other in ipairs(touching) do
+                if not isTouchMyPart(other) and not checked[other] then
+                    checked[other] = true
+                    mutePartTouchSignals(other)
+                end
+            end
+        end
+    end
+end
+
+local function clearTouchPartConns()
+    for _, conns in pairs(touchPartConns) do
+        for _, conn in ipairs(conns) do pcall(function() conn:Disconnect() end) end
+    end
+    wipeTable(touchPartConns)
+end
+
+local function bindTouchPartAntiReset(part)
+    if touchPartConns[part] then return end
+    touchPartConns[part] = {}
+    local function guard(prop, desired)
+        table.insert(touchPartConns[part], part:GetPropertyChangedSignal(prop):Connect(function()
+            if not isTouchBlockOn then return end
+            if part[prop] ~= desired then pcall(function() part[prop] = desired end) end
+        end))
+    end
+    guard("CanTouch", false)
+    if not isTouchRootPart(part) then guard("CanCollide", false) end
+    guard("CanQuery", false)
+end
+
+local function hardenTouchPart(part)
+    if not part:IsA("BasePart") then return end
+    rememberTouchPart(part)
+    pcall(function() part.CanTouch = false end)
+    pcall(function() part.CanQuery = false end)
+    pcall(function() part.CollisionGroup = TOUCH_COLLISION_GROUP end)
+    if isTouchRootPart(part) then
+        pcall(function() part.CanCollide = true end)
+    else
+        pcall(function() part.CanCollide = false end)
+        pcall(function() part.Massless = true end)
+    end
+    removeTouchInternals(part)
+    mutePartTouchSignals(part)
+    bindTouchPartAntiReset(part)
+end
+
+local function softenTouchPart(part)
+    if not part:IsA("BasePart") then return end
+    local saved = touchSavedProps[part]
+    if saved then
+        pcall(function() part.CanTouch       = saved.CanTouch end)
+        pcall(function() part.CanCollide     = saved.CanCollide end)
+        pcall(function() part.CanQuery       = saved.CanQuery end)
+        pcall(function() part.CollisionGroup = saved.CollisionGroup end)
+    else
+        pcall(function() part.CanTouch = true end)
+        pcall(function() part.CanCollide = true end)
+        pcall(function() part.CanQuery = true end)
+    end
+    pcall(function() part.Massless = false end)
+end
+
+local function applyTouchToCharacter(char, enabled)
+    if not char then return end
+    for _, obj in ipairs(char:GetDescendants()) do
+        if obj:IsA("BasePart") then
+            if enabled then hardenTouchPart(obj) else softenTouchPart(obj) end
+        end
+    end
+end
+
+local function enforceTouchCharacter(char)
+    for _, obj in ipairs(char:GetDescendants()) do
+        if obj:IsA("BasePart") then
+            if obj.CanTouch then pcall(function() obj.CanTouch = false end) end
+            if obj.CanQuery then pcall(function() obj.CanQuery = false end) end
+            if not isTouchRootPart(obj) and obj.CanCollide then
+                pcall(function() obj.CanCollide = false end)
+            end
+            if obj.CollisionGroup ~= TOUCH_COLLISION_GROUP then
+                pcall(function() obj.CollisionGroup = TOUCH_COLLISION_GROUP end)
+            end
+            removeTouchInternals(obj)
+        end
+    end
+end
+
+local function clearTouchCharConns()
+    clearTouchList(touchCharConns)
+    clearTouchPartConns()
+    restoreTouchSignals()
+end
+
+local function bindTouchCharacter(char)
+    clearTouchCharConns()
+    if not char then return end
+    applyTouchToCharacter(char, isTouchBlockOn)
+    table.insert(touchCharConns, char.DescendantAdded:Connect(function(obj)
+        if not isTouchBlockOn or not obj:IsA("BasePart") then return end
+        deferFn(function()
+            if isTouchBlockOn and obj.Parent then hardenTouchPart(obj) end
+        end)
+    end))
+    table.insert(touchCharConns, char.AncestryChanged:Connect(function(_, parent)
+        if not parent then clearTouchCharConns() end
+    end))
+end
+
+local function startTouchLoops()
+    clearTouchList(touchLoopConns)
+    table.insert(touchLoopConns, RunService.Heartbeat:Connect(function()
+        if not isTouchBlockOn then return end
+        local char = localPlayer.Character
+        if char then enforceTouchCharacter(char) end
+    end))
+    table.insert(touchLoopConns, RunService.PostSimulation:Connect(function()
+        if not isTouchBlockOn then return end
+        local char = localPlayer.Character
+        if char then silenceExternalTouching(char) end
+    end))
+end
+
+local function stopTouchLoops()
+    clearTouchList(touchLoopConns)
+end
+
+local function setTouchBlock(enabled)
+    isTouchBlockOn = enabled
+    pcall(installTouchFireHook)
+    pcall(installTouchNamecallHook)
+    local char = localPlayer.Character
+    if enabled then
+        if char then
+            applyTouchToCharacter(char, true)
+            bindTouchCharacter(char)
+        end
+        startTouchLoops()
+    else
+        clearTouchCharConns()
+        stopTouchLoops()
+        if char then
+            applyTouchToCharacter(char, false)
+            bindTouchCharacter(char)
+        end
+    end
+end
+
+-- ==========================================
+-- [ COLOR PALETTE ]
+-- ==========================================
+local C = {
+    BG          = Color3.fromRGB(9,   9,   13),
+    BG_HEADER   = Color3.fromRGB(12,  12,  18),
+    BG_TAB      = Color3.fromRGB(14,  14,  20),
+    ACCENT      = Color3.fromRGB(210, 40,  40),
+    GREEN       = Color3.fromRGB(50,  200, 100),
+    WHITE       = Color3.fromRGB(225, 225, 232),
+    DIM         = Color3.fromRGB(90,  90,  105),
+    SEPARATOR   = Color3.fromRGB(30,  30,  42),
+    BTN_OFF_BG  = Color3.fromRGB(20,  13,  13),
+    BTN_ON_BG   = Color3.fromRGB(12,  26,  16),
+    RED_TEXT    = Color3.fromRGB(210, 85,  85),
+    GREEN_TEXT  = Color3.fromRGB(75,  210, 125),
+    SCROLL_BG   = Color3.fromRGB(13,  13,  19),
+}
+
+-- ==========================================
+-- [ SCREEN GUI ]
+-- ==========================================
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name         = "PrecisePredictiveGuiMobile"
+screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.Parent       = (gethui and gethui()) or localPlayer:WaitForChild("PlayerGui")
+
+-- ==========================================
+-- [ MAIN FRAME — 모바일 뷰포트 기준 크기 ]
+-- ==========================================
+local viewport  = camera.ViewportSize
+local FRAME_W   = math.floor(math.clamp(viewport.X * 0.94, 300, 420))
+local FRAME_H   = math.floor(math.clamp(viewport.Y * 0.90, 580, 780))
+local HEADER_H  = 54
+local TAB_H     = 42
+local CONTENT_Y = HEADER_H + TAB_H + 1
+local BTN_H     = 46
+local ROW_H     = 34
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Size             = UDim2.new(0, FRAME_W, 0, FRAME_H)
+if pendingGui.x == 10 and pendingGui.y == 10 then
+    mainFrame.Position = UDim2.new(0.5, -math.floor(FRAME_W / 2), 0.02, 0)
+else
+    mainFrame.Position = UDim2.new(0, pendingGui.x, 0, pendingGui.y)
+end
+mainFrame.BackgroundColor3 = C.BG
+mainFrame.BorderSizePixel  = 0
+mainFrame.Active           = true
+mainFrame.Draggable        = false
+mainFrame.Parent           = screenGui
+do
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 10)
+    c.Parent       = mainFrame
+    local s = Instance.new("UIStroke")
+    s.Color     = Color3.fromRGB(45, 18, 18)
+    s.Thickness = 1.5
+    s.Parent    = mainFrame
+end
+
+-- ==========================================
+-- [ HEADER ]
+-- ==========================================
+local headerFrame = Instance.new("Frame")
+headerFrame.Size             = UDim2.new(1, 0, 0, HEADER_H)
+headerFrame.BackgroundColor3 = C.BG_HEADER
+headerFrame.BorderSizePixel  = 0
+headerFrame.Active           = true
+headerFrame.Parent           = mainFrame
+do
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 10)
+    c.Parent       = headerFrame
+    local fill = Instance.new("Frame")
+    fill.Size             = UDim2.new(1, 0, 0, 10)
+    fill.Position         = UDim2.new(0, 0, 1, -10)
+    fill.BackgroundColor3 = C.BG_HEADER
+    fill.BorderSizePixel  = 0
+    fill.Parent           = headerFrame
+end
+
+local accentBar = Instance.new("Frame")
+accentBar.Size             = UDim2.new(0, 3, 0, 28)
+accentBar.Position         = UDim2.new(0, 0, 0.5, -14)
+accentBar.BackgroundColor3 = C.ACCENT
+accentBar.BorderSizePixel  = 0
+accentBar.Parent           = headerFrame
+do
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 2)
+    c.Parent       = accentBar
+end
+
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Size                 = UDim2.new(1, -70, 1, 0)
+titleLabel.Position             = UDim2.new(0, 12, 0, 0)
+titleLabel.BackgroundTransparency = 1
+titleLabel.Text                 = "CRAZY MOBILE | ON"
+titleLabel.TextColor3           = C.WHITE
+titleLabel.TextSize             = 14
+titleLabel.Font                 = Enum.Font.SourceSansBold
+titleLabel.TextXAlignment       = Enum.TextXAlignment.Left
+titleLabel.Parent               = headerFrame
+
+local sysTapBtn = Instance.new("TextButton")
+sysTapBtn.Size             = UDim2.new(0, 54, 0, 34)
+sysTapBtn.Position         = UDim2.new(1, -60, 0.5, -17)
+sysTapBtn.BackgroundColor3 = C.BTN_ON_BG
+sysTapBtn.Text             = "ON"
+sysTapBtn.TextColor3       = C.GREEN_TEXT
+sysTapBtn.TextSize         = 13
+sysTapBtn.Font             = Enum.Font.SourceSansBold
+sysTapBtn.AutoButtonColor  = false
+sysTapBtn.BorderSizePixel  = 0
+sysTapBtn.Parent           = headerFrame
+do
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 7)
+    c.Parent       = sysTapBtn
+    local s = Instance.new("UIStroke")
+    s.Color     = Color3.fromRGB(22, 55, 28)
+    s.Thickness = 1
+    s.Parent    = sysTapBtn
+end
+
+local function syncMobileSysBtn()
+    if isSystemOn then
+        titleLabel.Text            = "CRAZY MOBILE | ON"
+        titleLabel.TextColor3      = C.WHITE
+        accentBar.BackgroundColor3 = C.ACCENT
+        sysTapBtn.Text             = "ON"
+        sysTapBtn.TextColor3       = C.GREEN_TEXT
+        sysTapBtn.BackgroundColor3 = C.BTN_ON_BG
+    else
+        titleLabel.Text            = "CRAZY MOBILE | OFF"
+        titleLabel.TextColor3      = C.DIM
+        accentBar.BackgroundColor3 = C.DIM
+        sysTapBtn.Text             = "OFF"
+        sysTapBtn.TextColor3       = C.RED_TEXT
+        sysTapBtn.BackgroundColor3 = C.BTN_OFF_BG
+    end
+end
+
+sysTapBtn.MouseButton1Click:Connect(function()
+    isSystemOn = not isSystemOn
+    if not isSystemOn then
+        indicator.Transparency = 1
+        safeMouseRelease()
+    end
+    syncMobileSysBtn()
+    scheduleSaveConfig()
+end)
+
+-- 터치 드래그 (타이틀 영역 잡고 이동)
+do
+    local dragging, dragStart, startPos
+    titleLabel.Active = true
+    titleLabel.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging  = true
+            dragStart = input.Position
+            startPos  = mainFrame.Position
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch then
+            local d = input.Position - dragStart
+            mainFrame.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + d.X,
+                startPos.Y.Scale, startPos.Y.Offset + d.Y
+            )
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+end
+
+-- ==========================================
+-- [ TAB BAR ]
+-- ==========================================
+local tabBar = Instance.new("Frame")
+tabBar.Size             = UDim2.new(1, 0, 0, TAB_H)
+tabBar.Position         = UDim2.new(0, 0, 0, HEADER_H)
+tabBar.BackgroundColor3 = C.BG_TAB
+tabBar.BorderSizePixel  = 0
+tabBar.Parent           = mainFrame
+
+local function makeTabBtn(label, xPos)
+    local btn = Instance.new("TextButton")
+    btn.Size             = UDim2.new(0.5, 0, 1, 0)
+    btn.Position         = UDim2.new(xPos, 0, 0, 0)
+    btn.BackgroundColor3 = C.BG_TAB
+    btn.Text             = label
+    btn.TextColor3       = C.DIM
+    btn.TextSize         = 14
+    btn.Font             = Enum.Font.SourceSansBold
+    btn.BorderSizePixel  = 0
+    btn.AutoButtonColor  = false
+    btn.Parent           = tabBar
+    return btn
+end
+
+local tabMain = makeTabBtn("Main", 0)
+local tabMisc = makeTabBtn("Misc", 0.5)
+
+-- Active underline indicator
+local tabLine = Instance.new("Frame")
+tabLine.Size             = UDim2.new(0.5, 0, 0, 2)
+tabLine.Position         = UDim2.new(0, 0, 1, -2)
+tabLine.BackgroundColor3 = C.ACCENT
+tabLine.BorderSizePixel  = 0
+tabLine.Parent           = tabBar
+
+-- Separator below tab bar
+local tabSep = Instance.new("Frame")
+tabSep.Size             = UDim2.new(1, 0, 0, 1)
+tabSep.Position         = UDim2.new(0, 0, 0, CONTENT_Y - 1)
+tabSep.BackgroundColor3 = C.SEPARATOR
+tabSep.BorderSizePixel  = 0
+tabSep.Parent           = mainFrame
+
+-- ==========================================
+-- [ CONTENT FRAMES ]
+-- ==========================================
+local CONTENT_H = FRAME_H - CONTENT_Y
+local MAIN_CANVAS_H = 720
+local MISC_CANVAS_H = CONTENT_H + 80
+
+local mainScroll = Instance.new("ScrollingFrame")
+mainScroll.Size                   = UDim2.new(1, 0, 1, -CONTENT_Y)
+mainScroll.Position               = UDim2.new(0, 0, 0, CONTENT_Y)
+mainScroll.BackgroundTransparency = 1
+mainScroll.BorderSizePixel        = 0
+mainScroll.ScrollBarThickness     = 5
+mainScroll.ScrollBarImageColor3   = C.ACCENT
+mainScroll.CanvasSize             = UDim2.new(0, 0, 0, MAIN_CANVAS_H)
+mainScroll.AutomaticCanvasSize    = Enum.AutomaticSize.None
+mainScroll.Parent                 = mainFrame
+
+local miscScroll = Instance.new("ScrollingFrame")
+miscScroll.Size                   = UDim2.new(1, 0, 1, -CONTENT_Y)
+miscScroll.Position               = UDim2.new(0, 0, 0, CONTENT_Y)
+miscScroll.BackgroundTransparency = 1
+miscScroll.BorderSizePixel        = 0
+miscScroll.ScrollBarThickness     = 5
+miscScroll.ScrollBarImageColor3   = C.ACCENT
+miscScroll.CanvasSize             = UDim2.new(0, 0, 0, MISC_CANVAS_H)
+miscScroll.Visible                = false
+miscScroll.Parent                 = mainFrame
+
+local mainContent = Instance.new("Frame")
+mainContent.Size                 = UDim2.new(1, 0, 0, MAIN_CANVAS_H)
+mainContent.Position             = UDim2.new(0, 0, 0, 0)
+mainContent.BackgroundTransparency = 1
+mainContent.BorderSizePixel      = 0
+mainContent.Visible              = true
+mainContent.Parent               = mainScroll
+
+local miscContent = Instance.new("Frame")
+miscContent.Size                 = UDim2.new(1, 0, 0, MISC_CANVAS_H)
+miscContent.Position             = UDim2.new(0, 0, 0, 0)
+miscContent.BackgroundTransparency = 1
+miscContent.BorderSizePixel      = 0
+miscContent.Visible              = false
+miscContent.Parent               = miscScroll
+
+-- Tab switch
+local function switchTab(toMain)
+    mainScroll.Visible   = toMain
+    miscScroll.Visible   = not toMain
+    tabMain.TextColor3   = toMain and C.WHITE or C.DIM
+    tabMisc.TextColor3   = toMain and C.DIM   or C.WHITE
+    tabLine.Position     = toMain
+        and UDim2.new(0, 0, 1, -2)
+        or  UDim2.new(0.5, 0, 1, -2)
+    scheduleSaveConfig()
+end
+
+tabMain.MouseButton1Click:Connect(function() switchTab(true)  end)
+tabMisc.MouseButton1Click:Connect(function() switchTab(false) end)
+
+-- ==========================================
+-- [ GUI HELPERS ]
+-- ==========================================
+local function makeSep(parent, y)
+    local f = Instance.new("Frame")
+    f.Size             = UDim2.new(1, -20, 0, 1)
+    f.Position         = UDim2.new(0, 10, 0, y)
+    f.BackgroundColor3 = C.SEPARATOR
+    f.BorderSizePixel  = 0
+    f.Parent           = parent
+end
+
+local function makeSecLbl(parent, text, y)
+    local l = Instance.new("TextLabel")
+    l.Size                 = UDim2.new(1, -16, 0, 18)
+    l.Position             = UDim2.new(0, 10, 0, y)
+    l.BackgroundTransparency = 1
+    l.Text                 = text
+    l.TextColor3           = C.DIM
+    l.TextSize             = 11
+    l.Font                 = Enum.Font.SourceSansBold
+    l.TextXAlignment       = Enum.TextXAlignment.Left
+    l.Parent               = parent
+end
+
+local function makeBtn(parent, text, y)
+    local btn = Instance.new("TextButton")
+    btn.Size             = UDim2.new(1, -16, 0, BTN_H)
+    btn.Position         = UDim2.new(0, 8, 0, y)
+    btn.BackgroundColor3 = C.BTN_OFF_BG
+    btn.Text             = ""
+    btn.AutoButtonColor  = false
+    btn.BorderSizePixel  = 0
+    btn.Parent           = parent
+
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 7)
+    c.Parent       = btn
+
+    local s = Instance.new("UIStroke")
+    s.Color     = Color3.fromRGB(55, 22, 22)
+    s.Thickness = 1
+    s.Parent    = btn
+
+    local dot = Instance.new("Frame")
+    dot.Size             = UDim2.new(0, 9, 0, 9)
+    dot.Position         = UDim2.new(0, 12, 0.5, -4)
+    dot.BackgroundColor3 = Color3.fromRGB(160, 45, 45)
+    dot.BorderSizePixel  = 0
+    dot.Parent           = btn
+    do
+        local dc = Instance.new("UICorner")
+        dc.CornerRadius = UDim.new(1, 0)
+        dc.Parent       = dot
+    end
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size                 = UDim2.new(1, -32, 1, 0)
+    lbl.Position             = UDim2.new(0, 27, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text                 = text
+    lbl.TextColor3           = C.RED_TEXT
+    lbl.TextSize             = 13
+    lbl.Font                 = Enum.Font.SourceSansSemibold
+    lbl.TextXAlignment       = Enum.TextXAlignment.Left
+    lbl.Parent               = btn
+
+    return btn, lbl, dot, s
+end
+
+local function setBtnState(btn, lbl, dot, stroke, on, tOn, tOff)
+    if on then
+        btn.BackgroundColor3 = C.BTN_ON_BG
+        lbl.Text             = tOn
+        lbl.TextColor3       = C.GREEN_TEXT
+        dot.BackgroundColor3 = C.GREEN
+        stroke.Color         = Color3.fromRGB(22, 55, 28)
+    else
+        btn.BackgroundColor3 = C.BTN_OFF_BG
+        lbl.Text             = tOff
+        lbl.TextColor3       = C.RED_TEXT
+        dot.BackgroundColor3 = Color3.fromRGB(160, 45, 45)
+        stroke.Color         = Color3.fromRGB(55, 22, 22)
+    end
+end
+
+-- ==========================================
+-- [ MAIN TAB : TARGET LIST ]
+-- ==========================================
+makeSecLbl(mainContent, "-- TARGET LIST", 5)
+
+local scrollFrame = Instance.new("ScrollingFrame")
+scrollFrame.Size                   = UDim2.new(1, -16, 0, 190)
+scrollFrame.Position               = UDim2.new(0, 8, 0, 28)
+scrollFrame.BackgroundColor3       = C.SCROLL_BG
+scrollFrame.BackgroundTransparency = 0
+scrollFrame.BorderSizePixel        = 0
+scrollFrame.CanvasSize             = UDim2.new(0, 0, 0, 0)
+scrollFrame.ScrollBarThickness     = 5
+scrollFrame.ScrollBarImageColor3   = C.ACCENT
+scrollFrame.Parent                 = mainContent
+do
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 7)
+    c.Parent       = scrollFrame
+    local p = Instance.new("UIPadding")
+    p.PaddingTop    = UDim.new(0, 5)
+    p.PaddingBottom = UDim.new(0, 5)
+    p.PaddingLeft   = UDim.new(0, 5)
+    p.PaddingRight  = UDim.new(0, 5)
+    p.Parent        = scrollFrame
+end
+
+local listLayout = Instance.new("UIListLayout")
+listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+listLayout.Padding   = UDim.new(0, 3)
+listLayout.Parent    = scrollFrame
+
+-- ==========================================
+-- [ MAIN TAB : CONTROLS ]
+-- ==========================================
+makeSep(mainContent, 224)
+makeSecLbl(mainContent, "-- CONTROLS", 230)
+
+local autoTwoBtn,    autoTwoLbl,    autoTwoDot,    autoTwoStroke    = makeBtn(mainContent, "Weapon2 Skill (18s): OFF", 252)
+local autoItemBtn,   autoItemLbl,   autoItemDot,   autoItemStroke   = makeBtn(mainContent, "Auto Item  (5min): OFF",   294)
+local autoTargetBtn, autoTargetLbl, autoTargetDot, autoTargetStroke = makeBtn(mainContent, "Auto Target:       OFF",   336)
+local autoMoveBtn,   autoMoveLbl,   autoMoveDot,   autoMoveStroke   = makeBtn(mainContent, "Auto Move: OFF",          378)
+local touchBlockBtn, touchBlockLbl, touchBlockDot, touchBlockStroke = makeBtn(mainContent, "Touch Block: OFF",       420)
+
+-- Setrairty number input (Enter = FireServer + config save)
+makeSecLbl(mainContent, "-- SETRAIRTY", 462)
+
+local setrairtyBox = Instance.new("TextBox")
+setrairtyBox.Size             = UDim2.new(1, -16, 0, 38)
+setrairtyBox.Position         = UDim2.new(0, 8, 0, 484)
+setrairtyBox.BackgroundColor3 = C.SCROLL_BG
+setrairtyBox.TextColor3       = C.WHITE
+setrairtyBox.PlaceholderText  = "숫자 입력 후 Enter"
+setrairtyBox.PlaceholderColor3 = C.DIM
+setrairtyBox.Text             = ""
+setrairtyBox.ClearTextOnFocus = false
+setrairtyBox.Font             = Enum.Font.SourceSansSemibold
+setrairtyBox.TextSize         = 14
+setrairtyBox.TextXAlignment   = Enum.TextXAlignment.Center
+setrairtyBox.BorderSizePixel  = 0
+setrairtyBox.Parent           = mainContent
+do
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 6)
+    c.Parent       = setrairtyBox
+    local s = Instance.new("UIStroke")
+    s.Color     = Color3.fromRGB(55, 22, 22)
+    s.Thickness = 1
+    s.Parent    = setrairtyBox
+end
+
+local function getVipSpawnRemote()
+    local pg = localPlayer:FindFirstChild("PlayerGui")
+    if not pg then return nil end
+    local ok, ev = pcall(function()
+        return pg.VIPGUI.VipMenuFrame.Server.CantSpawn.TextButton.RemoteEvent
+    end)
+    return ok and ev or nil
+end
+
+local function fireSetrairty(value)
+    local num = tonumber(value)
+    if not num then return false end
+    local ev = getVipSpawnRemote()
+    if not ev then return false end
+    return pcall(function()
+        ev:FireServer(num)
+    end)
+end
+
+local function submitSetrairty(rawText)
+    local text = tostring(rawText or ""):gsub("%D", "")
+    if text == "" then return end
+    local num = tonumber(text)
+    if not num then return end
+
+    setrairtyValue = num
+    setrairtyBox.Text = text
+    fireSetrairty(num)
+    scheduleSaveConfig()
+end
+
+setrairtyBox:GetPropertyChangedSignal("Text"):Connect(function()
+    local filtered = setrairtyBox.Text:gsub("%D", "")
+    if filtered ~= setrairtyBox.Text then
+        local pos = setrairtyBox.CursorPosition
+        setrairtyBox.Text = filtered
+        setrairtyBox.CursorPosition = math.min(pos, #filtered + 1)
+    end
+end)
+
+setrairtyBox.FocusLost:Connect(function(enterPressed)
+    if enterPressed then
+        submitSetrairty(setrairtyBox.Text)
+    end
+end)
+
+-- ==========================================
+-- [ MISC TAB : ENTITY WATCH + MUTE LIST ]
+-- ==========================================
+makeSecLbl(miscContent, "-- DISCORD NOTIFY", 5)
+
+local nBtn, nLbl, nDot, nStroke = makeBtn(miscContent, "Entity Watch: OFF", 28)
+
+makeSecLbl(miscContent, "-- SERVER LINK", 72)
+
+local serverLinkBox = Instance.new("TextBox")
+serverLinkBox.Size             = UDim2.new(1, -16, 0, 38)
+serverLinkBox.TextSize         = 12
+serverLinkBox.TextXAlignment   = Enum.TextXAlignment.Left
+serverLinkBox.TextTruncate     = Enum.TextTruncate.AtEnd
+serverLinkBox.BorderSizePixel  = 0
+serverLinkBox.Parent           = miscContent
+do
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 6)
+    c.Parent       = serverLinkBox
+    local s = Instance.new("UIStroke")
+    s.Color     = Color3.fromRGB(55, 22, 22)
+    s.Thickness = 1
+    s.Parent    = serverLinkBox
+    local p = Instance.new("UIPadding")
+    p.PaddingLeft = UDim.new(0, 8)
+    p.Parent      = serverLinkBox
+end
+
+local function submitServerLink(rawText)
+    local link = tostring(rawText or ""):match("^%s*(.-)%s*$") or ""
+    serverLinkValue = link
+    serverLinkBox.Text = link
+    scheduleSaveConfig()
+end
+
+serverLinkBox.FocusLost:Connect(function(enterPressed)
+    if enterPressed then
+        submitServerLink(serverLinkBox.Text)
+    end
+end)
+
+local MISC_LIST_TOP = 152
+
+makeSep(miscContent, 126)
+
+-- Two-column headers (Active / Muted)
+local activeHeader = Instance.new("TextLabel")
+activeHeader.Size                   = UDim2.new(0.5, -10, 0, 18)
+activeHeader.Position               = UDim2.new(0, 8, 0, MISC_LIST_TOP - 6)
+activeHeader.BackgroundTransparency = 1
+activeHeader.Text                   = "-- ACTIVE"
+activeHeader.TextColor3             = C.GREEN_TEXT
+activeHeader.TextSize               = 10
+activeHeader.Font                   = Enum.Font.SourceSansBold
+activeHeader.TextXAlignment         = Enum.TextXAlignment.Left
+activeHeader.Parent                 = miscContent
+
+local mutedHeader = Instance.new("TextLabel")
+mutedHeader.Size                   = UDim2.new(0.5, -10, 0, 18)
+mutedHeader.Position               = UDim2.new(0.5, 2, 0, MISC_LIST_TOP - 6)
+mutedHeader.BackgroundTransparency = 1
+mutedHeader.Text                   = "-- MUTED"
+mutedHeader.TextColor3             = C.RED_TEXT
+mutedHeader.TextSize               = 10
+mutedHeader.Font                   = Enum.Font.SourceSansBold
+mutedHeader.TextXAlignment         = Enum.TextXAlignment.Left
+mutedHeader.Parent                 = miscContent
+
+-- Active models scroll (left column)
+local activeScroll = Instance.new("ScrollingFrame")
+activeScroll.Size                   = UDim2.new(0.5, -10, 0, CONTENT_H - MISC_LIST_TOP - 8)
+activeScroll.Position               = UDim2.new(0, 8, 0, MISC_LIST_TOP + 14)
+activeScroll.BackgroundColor3       = C.SCROLL_BG
+activeScroll.BackgroundTransparency = 0
+activeScroll.BorderSizePixel        = 0
+activeScroll.CanvasSize             = UDim2.new(0, 0, 0, 0)
+activeScroll.ScrollBarThickness     = 3
+activeScroll.ScrollBarImageColor3   = C.GREEN
+activeScroll.Parent                 = miscContent
+do
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 7)
+    c.Parent       = activeScroll
+    local p = Instance.new("UIPadding")
+    p.PaddingTop    = UDim.new(0, 5)
+    p.PaddingBottom = UDim.new(0, 5)
+    p.PaddingLeft   = UDim.new(0, 4)
+    p.PaddingRight  = UDim.new(0, 4)
+    p.Parent        = activeScroll
+end
+
+local activeLayout = Instance.new("UIListLayout")
+activeLayout.SortOrder = Enum.SortOrder.LayoutOrder
+activeLayout.Padding   = UDim.new(0, 3)
+activeLayout.Parent    = activeScroll
+
+-- Muted models scroll (right column)
+local mutedScroll = Instance.new("ScrollingFrame")
+mutedScroll.Size                   = UDim2.new(0.5, -10, 0, CONTENT_H - MISC_LIST_TOP - 8)
+mutedScroll.Position               = UDim2.new(0.5, 2, 0, MISC_LIST_TOP + 14)
+mutedScroll.BackgroundColor3       = C.SCROLL_BG
+mutedScroll.BackgroundTransparency = 0
+mutedScroll.BorderSizePixel        = 0
+mutedScroll.CanvasSize             = UDim2.new(0, 0, 0, 0)
+mutedScroll.ScrollBarThickness     = 3
+mutedScroll.ScrollBarImageColor3   = C.ACCENT
+mutedScroll.Parent                 = miscContent
+do
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 7)
+    c.Parent       = mutedScroll
+    local p = Instance.new("UIPadding")
+    p.PaddingTop    = UDim.new(0, 5)
+    p.PaddingBottom = UDim.new(0, 5)
+    p.PaddingLeft   = UDim.new(0, 4)
+    p.PaddingRight  = UDim.new(0, 4)
+    p.Parent        = mutedScroll
+end
+
+local mutedLayout = Instance.new("UIListLayout")
+mutedLayout.SortOrder = Enum.SortOrder.LayoutOrder
+mutedLayout.Padding   = UDim.new(0, 3)
+mutedLayout.Parent    = mutedScroll
+
+-- ==========================================
+-- [ MUTE LIST REFRESH ]
+-- ==========================================
+local function makeModelRow(parent, name, muted)
+    local row = Instance.new("TextButton")
+    row.Size             = UDim2.new(1, 0, 0, 26)
+    row.BackgroundColor3 = muted
+        and Color3.fromRGB(55, 15, 15)
+        or  Color3.fromRGB(18, 26, 20)
+    row.Text             = ""
+    row.AutoButtonColor  = false
+    row.BorderSizePixel  = 0
+    row.Parent           = parent
+    do
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 5)
+        c.Parent       = row
+        local s = Instance.new("UIStroke")
+        s.Color     = muted
+            and Color3.fromRGB(150, 35, 35)
+            or  Color3.fromRGB(30, 75, 45)
+        s.Thickness = 1
+        s.Parent    = row
+    end
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size                   = UDim2.new(1, -8, 1, 0)
+    lbl.Position               = UDim2.new(0, 5, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text                   = name
+    lbl.TextColor3             = muted and C.RED_TEXT or C.GREEN_TEXT
+    lbl.TextSize               = 11
+    lbl.Font                   = Enum.Font.SourceSans
+    lbl.TextXAlignment         = Enum.TextXAlignment.Left
+    lbl.TextTruncate           = Enum.TextTruncate.AtEnd
+    lbl.Parent                 = row
+
+    return row
+end
+
+local function refreshBlockList()
+    -- Clear both columns
+    for _, child in ipairs(activeScroll:GetChildren()) do
+        if child:IsA("TextButton") then child:Destroy() end
+    end
+    for _, child in ipairs(mutedScroll:GetChildren()) do
+        if child:IsA("TextButton") then child:Destroy() end
+    end
+
+    for _, name in ipairs(seenModels) do
+        local muted = blockedNames[name] == true
+
+        if muted then
+            -- Muted column: click to unmute
+            local row = makeModelRow(mutedScroll, name, true)
+            row.MouseButton1Click:Connect(function()
+                blockedNames[name] = false
+                refreshBlockList()
+                scheduleSaveConfig()
+            end)
+        else
+            -- Active column: click to mute
+            local row = makeModelRow(activeScroll, name, false)
+            row.MouseButton1Click:Connect(function()
+                blockedNames[name] = true
+                refreshBlockList()
+                scheduleSaveConfig()
+            end)
+        end
+    end
+
+    activeScroll.CanvasSize = UDim2.new(0, 0, 0, activeLayout.AbsoluteContentSize.Y + 10)
+    mutedScroll.CanvasSize  = UDim2.new(0, 0, 0, mutedLayout.AbsoluteContentSize.Y + 10)
+end
+
+local function trackModelName(name)
+    for _, v in ipairs(seenModels) do
+        if v == name then return end
+    end
+    table.insert(seenModels, name)
+    refreshBlockList()
+    scheduleSaveConfig()
+end
+
+-- ==========================================
+-- [ DISCORD SEND ]
+-- ==========================================
+local function getConstantsFolder()
+    local mapFolder = Workspace:FindFirstChild("Map")
+    if not mapFolder then return nil end
+    for _, child in ipairs(mapFolder:GetChildren()) do
+        local c = child:FindFirstChild("Constants")
+        if c then return c end
+    end
+    return nil
+end
+
+local function getSignText()
+    -- workspace.Map.[random].Constants.Luck.Sign.SurfaceGui.SIGN
+    local constants = getConstantsFolder()
+    if not constants then return "N/A" end
+    local ok, v = pcall(function()
+        return constants.Luck.Sign.SurfaceGui.SIGN.Text
+    end)
+    return (ok and v) and v or "N/A"
+end
+
+local function getLuckText()
+    -- workspace.Map.[random].Constants.Luck.Luck.SurfaceGui.SIGN
+    local constants = getConstantsFolder()
+    if not constants then return "N/A" end
+    local ok, v = pcall(function()
+        return constants.Luck.Luck.SurfaceGui.SIGN.Text
+    end)
+    return (ok and v) and v or "N/A"
+end
+
+local function sendDiscord(modelName)
+    if not request then return end
+    if blockedNames[modelName] then return end
+    pcall(function()
+        request({
+            Url     = SERVER_URL .. "/notify",
+            Method  = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body    = HttpService:JSONEncode({
+                modelName  = modelName,
+                sign       = getSignText(),
+                luck       = getLuckText(),
+                time       = os.date("%Y-%m-%d %H:%M:%S UTC", os.time()),
+                serverLink = (serverLinkValue ~= "" and serverLinkValue) or nil,
+            }),
+        })
+    end)
+end
+
+-- ==========================================
+-- [ ENTITY WATCH ]
+-- ==========================================
+local function startWatch()
+    local ef = Workspace:WaitForChild("Entities", 10)
+    if not ef then return end
+    -- Seed existing models silently
+    for _, child in ipairs(ef:GetChildren()) do
+        if child:IsA("Model") then trackModelName(child.Name) end
+    end
+    watchConn = ef.ChildAdded:Connect(function(child)
+        if not child:IsA("Model") then return end
+        trackModelName(child.Name)
+        if isWatchOn then sendDiscord(child.Name) end
+    end)
+end
+
+local function stopWatch()
+    if watchConn then watchConn:Disconnect() ; watchConn = nil end
+end
+
+nBtn.MouseButton1Click:Connect(function()
+    isWatchOn = not isWatchOn
+    setBtnState(nBtn, nLbl, nDot, nStroke,
+        isWatchOn, "Entity Watch: ON ", "Entity Watch: OFF")
+    if isWatchOn then startWatch() else stopWatch() end
+    scheduleSaveConfig()
+end)
+
+-- Sync muted list from server every 30 s
+task.spawn(function()
+    while true do
+        task.wait(30)
+        pcall(function()
+            local res = request({
+                Url    = SERVER_URL .. "/muted-list",
+                Method = "GET",
+            })
+            if not (res and res.Body) then return end
+            local data = HttpService:JSONDecode(res.Body)
+            if not (data and data.muted) then return end
+            local changed = false
+            for _, nm in ipairs(data.muted) do
+                if not blockedNames[nm] then
+                    blockedNames[nm] = true
+                    changed = true
+                end
+            end
+            if changed then
+                refreshBlockList()
+                scheduleSaveConfig()
+            end
+        end)
+    end
+end)
+
+-- ==========================================
+-- [ WEAPON 2 SKILL ]
+-- ==========================================
+local function executeTwoSkill()
+    isSkillCasting = true
+    safeMouseRelease()
+
+    VIM:SendKeyEvent(true, Enum.KeyCode.Two, false, game)
+    task.wait(0.05)
+    VIM:SendKeyEvent(false, Enum.KeyCode.Two, false, game)
+    task.wait(0.5)
+
+    for _ = 1, 5 do
+        if not isAutoTwoOn then break end
+        syncMouseToAim()
+        local x = aimScreenX or 0
+        local y = aimScreenY or 0
+        VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
+        task.wait(0.05)
+        VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
+        task.wait(0.15)
+    end
+
+    VIM:SendKeyEvent(true, Enum.KeyCode.One, false, game)
+    task.wait(0.05)
+    VIM:SendKeyEvent(false, Enum.KeyCode.One, false, game)
+    task.wait(0.5)
+
+    isSkillCasting = false
+end
+
+local function startAutoTwoLoop()
+    task.spawn(function()
+        while isAutoTwoOn do
+            executeTwoSkill()
+            if not isAutoTwoOn then break end
+            task.wait(18)
+        end
+    end)
+end
+
+autoTwoBtn.MouseButton1Click:Connect(function()
+    isAutoTwoOn = not isAutoTwoOn
+    setBtnState(autoTwoBtn, autoTwoLbl, autoTwoDot, autoTwoStroke,
+        isAutoTwoOn, "Weapon2 Skill (18s): ON ", "Weapon2 Skill (18s): OFF")
+
+    if isAutoTwoOn then startAutoTwoLoop() end
+    scheduleSaveConfig()
+end)
+
+-- ==========================================
+-- [ AUTO ITEM ]
+-- ==========================================
+local function fireItems()
+    local pg = localPlayer:FindFirstChild("PlayerGui")
+    if not pg then return end
+    local consumables = pg:FindFirstChild("GuisNoReset")
+        and pg.GuisNoReset:FindFirstChild("InventoryFrame")
+        and pg.GuisNoReset.InventoryFrame:FindFirstChild("Consumables")
+    if not consumables then return end
+
+    pcall(function()
+        local ev = consumables:FindFirstChild("Determination")
+        if ev and ev:FindFirstChild("Frame") and ev.Frame:FindFirstChild("EQUIP") then
+            ev.Frame.EQUIP.RemoteEvent:FireServer(localPlayer)
+        end
+    end)
+    if not isAutoItemOn then return end
+    task.wait(6)
+
+    pcall(function()
+        local ev = consumables:FindFirstChild("Dice Of Fate")
+        if ev and ev:FindFirstChild("Frame") and ev.Frame:FindFirstChild("EQUIP") then
+            ev.Frame.EQUIP.RemoteEvent:FireServer(localPlayer)
+        end
+    end)
+    if not isAutoItemOn then return end
+    task.wait(6)
+
+    pcall(function()
+        local ev = consumables:FindFirstChild("Shot Of Integrity")
+        if ev and ev:FindFirstChild("Frame") and ev.Frame:FindFirstChild("EQUIP") then
+            ev.Frame.EQUIP.RemoteEvent:FireServer(localPlayer)
+        end
+    end)
+end
+
+local function startAutoItemLoop()
+    task.spawn(function()
+        while isAutoItemOn do
+            fireItems()
+            if not isAutoItemOn then break end
+            task.wait(300)
+        end
+    end)
+end
+
+autoItemBtn.MouseButton1Click:Connect(function()
+    isAutoItemOn = not isAutoItemOn
+    setBtnState(autoItemBtn, autoItemLbl, autoItemDot, autoItemStroke,
+        isAutoItemOn, "Auto Item  (5min): ON ", "Auto Item  (5min): OFF")
+    if isAutoItemOn then startAutoItemLoop() end
+    scheduleSaveConfig()
+end)
+
+-- ==========================================
+-- [ ENTITY LIST (Main tab scroll) ]
+-- ==========================================
+local function refreshEntityList()
+    for _, child in ipairs(scrollFrame:GetChildren()) do
+        if child:IsA("TextButton") then child:Destroy() end
+    end
+
+    local entitiesFolder = Workspace:FindFirstChild("Entities")
+    if not entitiesFolder then
+        scrollFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+        return
+    end
+
+    local nameCounts = {}
+    for _, model in ipairs(entitiesFolder:GetChildren()) do
+        if model:IsA("Model") then
+            local baseName = model.Name
+            nameCounts[baseName] = (nameCounts[baseName] or 0) + 1
+            local displayName = nameCounts[baseName] > 1
+                and (baseName .. "  [" .. nameCounts[baseName] .. "]") or baseName
+            local isSelected = (selectedModelInstance == model)
+
+            local btn = Instance.new("TextButton")
+            btn.Size             = UDim2.new(1, 0, 0, ROW_H)
+            btn.BackgroundColor3 = isSelected and Color3.fromRGB(80, 18, 18) or Color3.fromRGB(20, 20, 28)
+            btn.Text             = ""
+            btn.AutoButtonColor  = false
+            btn.BorderSizePixel  = 0
+            btn.Parent           = scrollFrame
+            do
+                local c = Instance.new("UICorner")
+                c.CornerRadius = UDim.new(0, 5)
+                c.Parent       = btn
+                local s = Instance.new("UIStroke")
+                s.Color     = isSelected and Color3.fromRGB(180, 40, 40) or Color3.fromRGB(35, 35, 48)
+                s.Thickness = 1
+                s.Parent    = btn
+            end
+
+            local sideBar = Instance.new("Frame")
+            sideBar.Size             = UDim2.new(0, 2, 0, 16)
+            sideBar.Position         = UDim2.new(0, 0, 0.5, -8)
+            sideBar.BackgroundColor3 = isSelected and C.ACCENT or C.DIM
+            sideBar.BorderSizePixel  = 0
+            sideBar.Parent           = btn
+            do
+                local c = Instance.new("UICorner")
+                c.CornerRadius = UDim.new(0, 1)
+                c.Parent       = sideBar
+            end
+
+            local lbl = Instance.new("TextLabel")
+            lbl.Size                 = UDim2.new(1, -14, 1, 0)
+            lbl.Position             = UDim2.new(0, 10, 0, 0)
+            lbl.BackgroundTransparency = 1
+            lbl.Text                 = displayName
+            lbl.TextColor3           = isSelected and C.WHITE or C.DIM
+            lbl.TextSize             = 12
+            lbl.Font                 = isSelected and Enum.Font.SourceSansBold or Enum.Font.SourceSans
+            lbl.TextXAlignment       = Enum.TextXAlignment.Left
+            lbl.TextTruncate         = Enum.TextTruncate.AtEnd
+            lbl.Parent               = btn
+
+            btn.MouseButton1Click:Connect(function()
+                if isAutoTargetOn then
+                    isAutoTargetOn = false
+                    setBtnState(autoTargetBtn, autoTargetLbl, autoTargetDot, autoTargetStroke,
+                        false, "Auto Target:       ON ", "Auto Target:       OFF")
+                end
+                if selectedModelInstance == model then
+                    safeMouseRelease() ; selectedModelInstance = nil
+                else
+                    safeMouseRelease() ; selectedModelInstance = model
+                end
+                refreshEntityList()
+                scheduleSaveConfig()
+            end)
+        end
+    end
+    scrollFrame.CanvasSize = UDim2.new(0, 0, 0, listLayout.AbsoluteContentSize.Y + 10)
+end
+
+autoTargetBtn.MouseButton1Click:Connect(function()
+    isAutoTargetOn = not isAutoTargetOn
+    setBtnState(autoTargetBtn, autoTargetLbl, autoTargetDot, autoTargetStroke,
+        isAutoTargetOn, "Auto Target:       ON ", "Auto Target:       OFF")
+    if not isAutoTargetOn then
+        safeMouseRelease()
+        selectedModelInstance = nil
+        refreshEntityList()
+    end
+    scheduleSaveConfig()
+end)
+
+local function toggleAutoMove()
+    isAutoMoveOn = not isAutoMoveOn
+    setBtnState(autoMoveBtn, autoMoveLbl, autoMoveDot, autoMoveStroke,
+        isAutoMoveOn, "Auto Move: ON", "Auto Move: OFF")
+    if not isAutoMoveOn then isApproaching = false end
+    scheduleSaveConfig()
+end
+
+autoMoveBtn.MouseButton1Click:Connect(toggleAutoMove)
+
+local function toggleTouchBlock()
+    local ok, err = pcall(function() setTouchBlock(not isTouchBlockOn) end)
+    if not ok then warn("[crazy22] TouchBlock error:", err) return end
+    setBtnState(touchBlockBtn, touchBlockLbl, touchBlockDot, touchBlockStroke,
+        isTouchBlockOn, "Touch Block: ON", "Touch Block: OFF")
+    scheduleSaveConfig()
+end
+
+touchBlockBtn.MouseButton1Click:Connect(toggleTouchBlock)
+
+localPlayer.CharacterAdded:Connect(function(char)
+    wipeTable(touchSavedProps)
+    if task and task.wait then task.wait(0.15) else wait(0.15) end
+    if isTouchBlockOn then bindTouchCharacter(char) end
+end)
+
+if isTouchBlockOn and localPlayer.Character then
+    bindTouchCharacter(localPlayer.Character)
+end
+
+pcall(installTouchFireHook)
+pcall(installTouchNamecallHook)
+
+-- ==========================================
+-- [ CONFIG SAVE / UI APPLY ]
+-- ==========================================
+local configSaveQueued = false
+
+local function resolveTargetByName(name)
+    if not name then return nil end
+    local ef = Workspace:FindFirstChild("Entities")
+    if not ef then return nil end
+    for _, model in ipairs(ef:GetChildren()) do
+        if model:IsA("Model") and model.Name == name and model:FindFirstChild("HumanoidRootPart") then
+            return model
+        end
+    end
+    return nil
+end
+
+local function buildConfigTable()
+    local muted = {}
+    for name, enabled in pairs(blockedNames) do
+        if enabled then table.insert(muted, name) end
+    end
+    table.sort(muted)
+
+    local tab = miscScroll.Visible and "misc" or "main"
+    local pos = mainFrame.Position
+
+    return {
+        version = CONFIG_VERSION,
+        aimbot = {
+            isSystemOn       = isSystemOn,
+            projectileSpeed  = projectileSpeed,
+            chargingDelay    = chargingDelay,
+            mouseSensitivity = mouseSensitivity,
+            leadMultiplier   = leadMultiplier,
+            extraFrontOffset = extraFrontOffset,
+            myVelocityWeight = myVelocityWeight,
+        },
+        toggles = {
+            isAutoTargetOn = isAutoTargetOn,
+            isAutoMoveOn   = isAutoMoveOn,
+            isAutoItemOn   = isAutoItemOn,
+            isAutoTwoOn    = isAutoTwoOn,
+            isTouchBlockOn = isTouchBlockOn,
+            isWatchOn      = isWatchOn,
+        },
+        selectedTargetName = selectedModelInstance and selectedModelInstance.Name or nil,
+        blockedNames       = muted,
+        seenModels         = copyStringList(seenModels),
+        Setrairty          = setrairtyValue,
+        serverLink         = serverLinkValue,
+        gui = {
+            x   = pos.X.Offset,
+            y   = pos.Y.Offset,
+            tab = tab,
+        },
+    }
+end
+
+local function saveConfigNow()
+    if not canUseConfigIO() then return end
+    local store = readConfigStore()
+    store[accountKey] = buildConfigTable()
+    writeConfigStore(store)
+end
+
+scheduleSaveConfig = function()
+    if configSaveQueued then return end
+    configSaveQueued = true
+    task.spawn(function()
+        if task.wait then task.wait(0.35) else wait(0.35) end
+        configSaveQueued = false
+        saveConfigNow()
+    end)
+end
+
+local function applyConfigUI()
+    syncMobileSysBtn()
+
+    setBtnState(autoTwoBtn, autoTwoLbl, autoTwoDot, autoTwoStroke,
+        isAutoTwoOn, "Weapon2 Skill (18s): ON ", "Weapon2 Skill (18s): OFF")
+    setBtnState(autoItemBtn, autoItemLbl, autoItemDot, autoItemStroke,
+        isAutoItemOn, "Auto Item  (5min): ON ", "Auto Item  (5min): OFF")
+    setBtnState(autoTargetBtn, autoTargetLbl, autoTargetDot, autoTargetStroke,
+        isAutoTargetOn, "Auto Target:       ON ", "Auto Target:       OFF")
+    setBtnState(autoMoveBtn, autoMoveLbl, autoMoveDot, autoMoveStroke,
+        isAutoMoveOn, "Auto Move: ON", "Auto Move: OFF")
+    setBtnState(touchBlockBtn, touchBlockLbl, touchBlockDot, touchBlockStroke,
+        isTouchBlockOn, "Touch Block: ON", "Touch Block: OFF")
+    setBtnState(nBtn, nLbl, nDot, nStroke,
+        isWatchOn, "Entity Watch: ON ", "Entity Watch: OFF")
+
+    if isTouchBlockOn then
+        pcall(function() setTouchBlock(true) end)
+    end
+    if isWatchOn then startWatch() end
+    if isAutoTwoOn then startAutoTwoLoop() end
+    if isAutoItemOn then startAutoItemLoop() end
+
+    switchTab(pendingGui.tab ~= "misc")
+
+    if pendingSelectedName then
+        selectedModelInstance = resolveTargetByName(pendingSelectedName)
+        pendingSelectedName = nil
+    end
+
+    refreshBlockList()
+
+    if serverLinkValue ~= "" then
+        serverLinkBox.Text = serverLinkValue
+    end
+
+    if setrairtyValue then
+        setrairtyBox.Text = tostring(setrairtyValue)
+        task.spawn(function()
+            for _ = 1, 30 do
+                if fireSetrairty(setrairtyValue) then break end
+                task.wait(0.5)
+            end
+        end)
+    end
+end
+
+mainFrame:GetPropertyChangedSignal("Position"):Connect(scheduleSaveConfig)
+
+local entitiesFolder = Workspace:WaitForChild("Entities", 5)
+if entitiesFolder then
+    entitiesFolder.ChildAdded:Connect(refreshEntityList)
+    entitiesFolder.ChildRemoved:Connect(refreshEntityList)
+end
+
+applyConfigUI()
+refreshEntityList()
+saveConfigNow()
+
+-- ==========================================
+-- [ WINDOW FOCUS — Alt-Tab 시에도 백그라운드 에임 유지 ]
+-- ==========================================
+UserInputService.WindowFocused:Connect(function()
+    isWindowFocused = true
+end)
+
+UserInputService.WindowFocusReleased:Connect(function()
+    isWindowFocused = false
+end)
+
+-- ==========================================
+-- [ KEY INPUT ]
+-- ==========================================
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.KeyCode == Enum.KeyCode.G then
+        isSystemOn = not isSystemOn
+        if not isSystemOn then
+            indicator.Transparency = 1
+            safeMouseRelease()
+        end
+        syncMobileSysBtn()
+        scheduleSaveConfig()
+    elseif input.KeyCode == Enum.KeyCode.H then
+        toggleAutoMove()
+    elseif input.KeyCode == Enum.KeyCode.J then
+        toggleTouchBlock()
+    end
+end)
+
+-- ==========================================
+-- [ AUTO TARGET SEARCH ]
+-- ==========================================
+local function findNextAutomaticTarget()
+    local myCharacter = localPlayer.Character
+    if not myCharacter or not myCharacter:FindFirstChild("HumanoidRootPart") then return nil end
+    local myPos = myCharacter.HumanoidRootPart.Position
+    local ef    = Workspace:FindFirstChild("Entities")
+    if not ef then return nil end
+    local closest, shortest = nil, math.huge
+    for _, model in ipairs(ef:GetChildren()) do
+        if model:IsA("Model") and model:FindFirstChild("HumanoidRootPart") then
+            local d = (model.HumanoidRootPart.Position - myPos).Magnitude
+            if d < shortest then shortest = d ; closest = model end
+        end
+    end
+    return closest
+end
+
+-- ==========================================
+-- [ RENDERSTEP MAIN LOOP ]
+-- ==========================================
+RunService.RenderStepped:Connect(function()
+    if _G.KoreanChatActive == true then
+        indicator.Transparency = 1
+        safeMouseRelease()
+        return
+    end
+
+    local myCharacter = localPlayer.Character
+    local humanoid    = myCharacter and myCharacter:FindFirstChildOfClass("Humanoid")
+    local myRoot      = myCharacter and myCharacter:FindFirstChild("HumanoidRootPart")
+
+    -- Auto movement
+    if isAutoMoveOn and humanoid and myRoot and isSystemOn then
+        local target     = selectedModelInstance
+        local targetRoot = target and target:FindFirstChild("HumanoidRootPart")
+
+        if targetRoot then
+            local dist = (targetRoot.Position - myRoot.Position).Magnitude
+            if dist > APPROACH_DIST then isApproaching = true end
+
+            if isApproaching then
+                if dist <= STOP_DIST then
+                    isApproaching  = false
+                    lastMoveChange = 0
+                else
+                    local dir = (targetRoot.Position - myRoot.Position) * Vector3.new(1, 0, 1)
+                    if dir.Magnitude > 0 then humanoid:Move(dir.Unit, false) end
+                    if math.random(1, 100) <= 40 then humanoid.Jump = true end
+                end
+            else
+                if tick() - lastMoveChange >= moveChangeInterval then
+                    lastMoveChange     = tick()
+                    moveChangeInterval = math.random(5, 15) / 10
+                    local rx = math.random(-1, 1)
+                    local rz = math.random(-1, 1)
+                    if rx == 0 and rz == 0 then rx = 1 end
+                    currentMoveDir = Vector3.new(rx, 0, rz)
+                    if math.random(1, 100) <= 40 then humanoid.Jump = true end
+                end
+                if currentMoveDir.Magnitude > 0 then
+                    humanoid:Move(currentMoveDir, true)
+                end
+            end
+        else
+            isApproaching = false
+            humanoid:Move(Vector3.new(0, 0, 0), false)
+        end
+    end
+
+    if not isSystemOn then
+        indicator.Transparency = 1
+        safeMouseRelease()
+        return
+    end
+
+    -- Auto targeting
+    if isAutoTargetOn then
+        local valid = selectedModelInstance
+            and selectedModelInstance.Parent
+            and selectedModelInstance:FindFirstChild("HumanoidRootPart")
+        if not valid then
+            local next = findNextAutomaticTarget()
+            if next ~= selectedModelInstance then
+                safeMouseRelease()
+                selectedModelInstance = next
+                refreshEntityList()
+            end
+        end
+    end
+
+    if not myRoot then
+        indicator.Transparency = 1
+        safeMouseRelease()
+        return
+    end
+
+    -- Auto equip weapon
+    local currentTool = myCharacter:FindFirstChildOfClass("Tool")
+    if not currentTool and not isEquipping and not isSkillCasting then
+        isEquipping = true
+        task.spawn(function()
+            safeMouseRelease()
+            VIM:SendKeyEvent(true,  Enum.KeyCode.One, false, game)
+            task.wait(0.05)
+            VIM:SendKeyEvent(false, Enum.KeyCode.One, false, game)
+            task.wait(0.5)
+            isEquipping = false
+        end)
+    end
+
+    -- Predictive aim & fire
+    local targetModel = selectedModelInstance
+    if targetModel and targetModel.Parent and targetModel:FindFirstChild("HumanoidRootPart") then
+        local targetRoot     = targetModel.HumanoidRootPart
+        local targetPos      = targetRoot.Position
+        local targetVelocity = targetRoot.AssemblyLinearVelocity or Vector3.new(0, 0, 0)
+        local myPos          = myRoot.Position
+        local myVelocity     = myRoot.AssemblyLinearVelocity or Vector3.new(0, 0, 0)
+
+        local predictedPos = calculateRelativeLeadPosition(
+            targetPos, targetVelocity, myPos, myVelocity, projectileSpeed)
+        indicator.Position     = predictedPos
+        indicator.Transparency = 0
+
+        local sx, sy, onScreen = worldToScreen(predictedPos)
+        if onScreen then
+            aimScreenX = sx
+            aimScreenY = sy
+            syncMouseToAim()
+        end
+
+        local targetCFrame = CFrame.new(camera.CFrame.Position, predictedPos)
+        if isWindowFocused or IS_TOUCH then
+            camera.CFrame = camera.CFrame:Lerp(targetCFrame, mouseSensitivity)
+        else
+            -- Alt-Tab 중: 마우스 위치가 (0,0)으로 고정되므로 카메라 즉시 조준
+            camera.CFrame = targetCFrame
+        end
+
+        if not isSkillCasting and onScreen and not IS_TOUCH then
+            if not isCharging then
+                safeMousePress()
+            elseif tick() - lastShotTime >= chargingDelay then
+                safeMouseRelease()
+            end
+        elseif not isSkillCasting then
+            safeMouseRelease()
+        end
+    else
+        if not isSkillCasting then safeMouseRelease() end
+        indicator.Transparency = 1
+        selectedModelInstance  = nil
+    end
+end)
