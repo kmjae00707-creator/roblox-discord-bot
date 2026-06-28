@@ -153,7 +153,7 @@ app.get('/', (_, res) => res.json({ status: 'ok' }));
  * Body: { modelName, sign, luck, time }
  */
 app.post('/notify', async (req, res) => {
-    const { modelName, sign, luck, time } = req.body || {};
+    const { modelName, sign, luck, time, serverLink } = req.body || {};
 
     if (!modelName) {
         return res.status(400).json({ error: 'modelName is required' });
@@ -184,22 +184,34 @@ app.post('/notify', async (req, res) => {
                 .setStyle(ButtonStyle.Secondary)
         );
 
+        const fields = [
+            { name: '모델명', value: `\`${modelName}\``, inline: true },
+            { name: 'Sign',   value: sign || 'N/A',        inline: true },
+            { name: 'Luck',   value: luck || 'N/A',        inline: true },
+        ];
+
+        const link = serverLink && String(serverLink).trim();
+        if (link) {
+            fields.push({
+                name: 'Server',
+                value: link.startsWith('http') ? `[Join Server](${link})` : link,
+                inline: true,
+            });
+        }
+
+        fields.push({ name: '시각', value: time || 'N/A', inline: false });
+
         await channel.send({
             content: '@everyone',
             embeds: [{
                 title: '새로운 모델이 생성되었습니다!',
                 color: 0xFF4444,
-                fields: [
-                    { name: '모델명', value: `\`${modelName}\``,  inline: true  },
-                    { name: 'Sign',   value: sign || 'N/A',        inline: true  },
-                    { name: 'Luck',   value: luck || 'N/A',        inline: true  },
-                    { name: '시각',   value: time || 'N/A',        inline: false },
-                ],
+                fields,
             }],
             components: [muteRow],
         });
 
-        console.log(`[NOTIFY] Sent: ${modelName}`);
+        console.log(`[NOTIFY] Sent: ${modelName}${link ? ` (link=${link})` : ''}`);
         res.json({ sent: true });
     } catch (e) {
         console.error('notify error:', e.message);
